@@ -47,9 +47,14 @@ class DHCPServer:
             while running:
                 try:
                     data, addr = self.dhcp_socket.recvfrom(1024)
-                    # Here you would parse the incoming DHCP message (RFC 2131)
                     print(f"[DHCP] Received data from {addr}: {data.hex()}")
-                    # TODO: Parse DHCP request and send appropriate responses
+                    
+                    # Parse the DHCP message
+                    dhcp_message = self.parse_dhcp_message(data)
+                    
+                    # Send appropriate response
+                    self.send_dhcp_response(dhcp_message, addr)
+                    
                 except socket.timeout:
                     continue
                 except OSError:
@@ -59,6 +64,25 @@ class DHCPServer:
         finally:
             if self.dhcp_socket:
                 self.dhcp_socket.close()
+
+    def parse_dhcp_message(self, data):
+        # Placeholder for parsing DHCP message
+        print("[DEBUG] Parsing DHCP message...")
+        # TODO: Implement actual parsing logic
+        return {}
+
+    def send_dhcp_response(self, dhcp_message, addr):
+        # Example implementation for sending a DHCP response
+        print("[DEBUG] Sending DHCP response...")
+
+        # Construct a simple DHCP offer message (this is a placeholder)
+        dhcp_offer = b'\x02' + b'\x01' * 239  # Example DHCP offer packet
+
+        try:
+            self.dhcp_socket.sendto(dhcp_offer, addr)
+            print(f"[DHCP] Sent DHCP offer to {addr}")
+        except Exception as e:
+            print(f"[ERROR] Failed to send DHCP response to {addr}: {e}")
 
     def handle_tcp_control(self):
         """ Listen for TCP connections for configuration/authentication (if needed) """
