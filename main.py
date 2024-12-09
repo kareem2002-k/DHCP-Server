@@ -2,8 +2,11 @@ import socket
 import threading
 import sys
 import signal
+import struct
+import random
 
 DHCP_SERVER_PORT = 67
+DHCP_CLIENT_PORT = 68
 TCP_CONTROL_PORT = 8080
 
 running = True
@@ -23,15 +26,18 @@ class DHCPServer:
         self.dhcp_socket = None
         self.tcp_socket = None
         self.threads = []
-        
+
+        # Simple IP pool for demonstration: 192.168.1.100 - 192.168.1.110
+        self.ip_pool = [f"192.168.1.{i}" for i in range(100,111)]
+        self.leases = {}  # MAC -> IP
+        self.offers = {}  # MAC -> IP offered but not yet confirmed
+
     def start(self):
         print("[INFO] Starting DHCP server...")
-        # Start UDP DHCP server thread
         udp_thread = threading.Thread(target=self.handle_dhcp, daemon=True)
         udp_thread.start()
         self.threads.append(udp_thread)
 
-        # Start TCP server thread for user authentication/CLI
         tcp_thread = threading.Thread(target=self.handle_tcp_control, daemon=True)
         tcp_thread.start()
         self.threads.append(tcp_thread)
@@ -41,15 +47,28 @@ class DHCPServer:
         try:
             self.dhcp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self.dhcp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+            # On some systems, binding to port 67 may require root privileges.
             self.dhcp_socket.bind(('0.0.0.0', self.dhcp_port))
             print(f"[INFO] DHCP UDP server listening on port {self.dhcp_port}...")
 
             while running:
                 try:
-                    data, addr = self.dhcp_socket.recvfrom(1024)
-                    # Here you would parse the incoming DHCP message (RFC 2131)
-                    print(f"[DHCP] Received data from {addr}: {data.hex()}")
-                    # TODO: Parse DHCP request and send appropriate responses
+                    data, addr = self.dhcp_socket.recvfrom(2048)
+                    if not data:
+                        continue
+
+                    # Parse incoming DHCP packet
+                    msg_type = self.get_dhcp_message_type(data)
+                    client_mac = self.get_mac_from_data(data)
+                    print(f"[DHCP] Received message type {msg_type} from {client_mac}")
+
+                    if msg_type == 1: # DHCPDISCOVER
+                        self.handle_discover(data, client_mac)
+                    elif msg_type == 3: # DHCPREQUEST
+                        self.handle_request(data, client_mac)
+                    # Additional message types like DHCPRELEASE (7) can be handled similarly.
+
                 except socket.timeout:
                     continue
                 except OSError:
@@ -93,11 +112,7 @@ class DHCPServer:
             try:
                 client_socket.sendall(b"Welcome to the DHCP server control interface.\n")
                 client_socket.sendall(b"Type 'status' to see server status, or 'quit' to disconnect.\n")
-            except ConnectionAbortedError:
-                print(f"[CONTROL] Client at {client_addr} aborted the connection.")
-                return
-            except ConnectionResetError:
-                print(f"[CONTROL] Connection with {client_addr} reset by peer.")
+            except (ConnectionAbortedError, ConnectionResetError):
                 return
 
             while running:
@@ -108,7 +123,7 @@ class DHCPServer:
                     command = data.decode('utf-8').strip().lower()
 
                     if command == 'status':
-                        status_msg = "Server is running.\n"
+                        status_msg = f"Server is running. Leases: {self.leases}\n"
                         client_socket.sendall(status_msg.encode('utf-8'))
                     elif command == 'quit':
                         client_socket.sendall(b"Goodbye.\n")
@@ -116,12 +131,154 @@ class DHCPServer:
                     else:
                         client_socket.sendall(b"Unknown command.\n")
                 except (ConnectionAbortedError, ConnectionResetError):
-                    print(f"[CONTROL] Connection with {client_addr} ended unexpectedly.")
                     break
 
+    # ---------------------------
+    # DHCP HANDLERS AND HELPERS
+    # ---------------------------
+
+    def handle_discover(self, data, client_mac):
+        # Find an IP to offer
+        offered_ip = self.select_ip_for_client(client_mac)
+        if not offered_ip:
+            print("[ERROR] No available IPs to offer.")
+            # In a real scenario you might just not respond to DISCOVER if no IP is available
+            return
+
+        self.offers[client_mac] = offered_ip
+        print(f"[DHCP] Offering IP {offered_ip} to {client_mac}")
+        packet = self.build_dhcp_packet(data, client_mac, offered_ip, msg_type=2) # DHCPOFFER = 2
+        # Broadcast the offer
+        self.dhcp_socket.sendto(packet, ('255.255.255.255', DHCP_CLIENT_PORT))
+
+    def handle_request(self, data, client_mac):
+        requested_ip = self.offers.get(client_mac)
+        if not requested_ip:
+            # Client is requesting an IP we didn't offer or state got lost
+            # Send DHCPNAK = 6
+            print(f"[ERROR] Client {client_mac} requested unknown IP.")
+            nak_packet = self.build_dhcp_packet(data, client_mac, "0.0.0.0", msg_type=6)
+            self.dhcp_socket.sendto(nak_packet, ('255.255.255.255', DHCP_CLIENT_PORT))
+            return
+
+        # If we got here, we know what we offered
+        # Assign the IP to the client
+        self.leases[client_mac] = requested_ip
+        # Remove from offers, since it's now confirmed
+        del self.offers[client_mac]
+        print(f"[DHCP] Acknowledging IP {requested_ip} for {client_mac}")
+        ack_packet = self.build_dhcp_packet(data, client_mac, requested_ip, msg_type=5) # DHCPACK = 5
+        self.dhcp_socket.sendto(ack_packet, ('255.255.255.255', DHCP_CLIENT_PORT))
+
+    def select_ip_for_client(self, client_mac):
+        # If client already has a lease
+        if client_mac in self.leases:
+            return self.leases[client_mac]
+
+        # If client already offered an IP but not completed request
+        if client_mac in self.offers:
+            return self.offers[client_mac]
+
+        # Pick a free IP
+        for ip in self.ip_pool:
+            if ip not in self.leases.values() and ip not in self.offers.values():
+                return ip
+        return None
+
+    def get_mac_from_data(self, data):
+        # BOOTP fields: op(1), htype(1), hlen(1), hops(1),
+        # xid(4), secs(2), flags(2), ciaddr(4), yiaddr(4),
+        # siaddr(4), giaddr(4), chaddr(16)
+        # chaddr is at offset 28 and length 16 bytes (first 6 are MAC)
+        chaddr = data[28:28+16]
+        mac_addr = chaddr[0:6]
+        return ':'.join('{:02x}'.format(b) for b in mac_addr)
+
+    def get_dhcp_message_type(self, data):
+        # DHCP options start after BOOTP fixed fields (236 bytes total: 0-236),
+        # first four bytes of options are DHCP magic cookie: 99.130.83.99
+        # Then options are TLV: Type(1), Length(1), Value(L).
+        # DHCP message type option is code 53, length 1, value = message type.
+        # We’ll parse until we find 53 or hit end/end option (255).
+        cookie = data[236:240]
+        if cookie != b'\x63\x82\x53\x63':
+            return None  # Not a valid DHCP packet
+
+        idx = 240
+        while idx < len(data):
+            opt = data[idx]
+            if opt == 255: # End
+                break
+            if opt == 0: # Padding
+                idx += 1
+                continue
+            length = data[idx+1]
+            value = data[idx+2:idx+2+length]
+            if opt == 53: # DHCP Message Type
+                return value[0]
+            idx += 2 + length
+        return None
+
+    def build_dhcp_packet(self, request_data, client_mac, ip, msg_type):
+        # This is a simplified way to build a DHCP reply.
+        # In real code, you must build a proper BOOTP header + options.
+        # For demonstration only:
+        
+        # Extract fields from request to reuse
+        # BOOTP fixed: we can copy most fields from the request and modify yiaddr and message type.
+        op = 2  # reply
+        htype = 1
+        hlen = 6
+        hops = 0
+
+        # Extract XID, a unique transaction ID from request
+        xid = request_data[4:8]
+        secs = b'\x00\x00'
+        flags = request_data[10:12]
+        ciaddr = request_data[12:16]
+        yiaddr = socket.inet_aton(ip)
+        siaddr = b'\x00\x00\x00\x00'
+        giaddr = b'\x00\x00\x00\x00'
+
+        # chaddr (client MAC) is same as from request
+        chaddr_bytes = bytes.fromhex(client_mac.replace(':',''))
+        chaddr = chaddr_bytes + b'\x00'*(16-len(chaddr_bytes))
+        
+        # Basic BOOTP header
+        bootp = struct.pack('!BBBB4sHH4s4s4s4s16s192x',
+                            op, htype, hlen, hops, xid, 0, 0, ciaddr, yiaddr, siaddr, giaddr, chaddr)
+
+        # DHCP magic cookie
+        magic_cookie = b'\x63\x82\x53\x63'
+
+        # DHCP options: message type (53)
+        dhcp_msg_type_opt = b'\x35\x01' + bytes([msg_type])
+
+        # Server identifier (54) - required
+        # Assume server IP is 192.168.1.1
+        server_id_opt = b'\x36\x04' + socket.inet_aton('192.168.1.1')
+
+        # Lease time (51) - 1 hour for demo
+        lease_time_opt = b'\x33\x04' + struct.pack('!I', 3600)
+
+        # Subnet mask (1) - 255.255.255.0
+        subnet_mask_opt = b'\x01\x04' + socket.inet_aton('255.255.255.0')
+
+        # Router (3) - 192.168.1.1
+        router_opt = b'\x03\x04' + socket.inet_aton('192.168.1.1')
+
+        # DNS (6) - Google DNS for demo
+        dns_opt = b'\x06\x04' + socket.inet_aton('8.8.8.8')
+
+        # End option
+        end_opt = b'\xff'
+
+        options = dhcp_msg_type_opt + server_id_opt + lease_time_opt + subnet_mask_opt + router_opt + dns_opt + end_opt
+
+        return bootp + magic_cookie + options
 
 def main():
-    global running  # Declare global before usage
+    global running
     server = DHCPServer()
     server.start()
     print("[INFO] Server started. Press Ctrl+C to stop.")
