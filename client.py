@@ -3,10 +3,29 @@ import sys
 import json
 import uuid
 import threading
+import os
+import random
+import string
 
 # Server Configuration
 SERVER_HOST = '127.0.0.1'  # Server's IP address
 SERVER_PORT = 65432        # Server's port
+
+# File to store the client_id
+CLIENT_ID_FILE = 'client_id.txt'
+
+# Function to generate or retrieve a fixed client_id
+def get_client_id():
+    if os.path.exists(CLIENT_ID_FILE):
+        with open(CLIENT_ID_FILE, 'r') as f:
+            client_id = f.read().strip()
+            if client_id:
+                return client_id
+    # Generate a new client_id and save it
+    client_id = str(uuid.uuid4())
+    with open(CLIENT_ID_FILE, 'w') as f:
+        f.write(client_id)
+    return client_id
 
 # Function to start the client
 def start_client():
@@ -33,8 +52,8 @@ def start_client():
             client.close()
             sys.exit()
 
-        # Generate a unique client identifier
-        client_id = str(uuid.uuid4())
+        # Retrieve the fixed client identifier
+        client_id = ''.join(random.choices(string.ascii_letters + string.digits, k=9))
 
         # Start a thread to listen for server messages
         listener_thread = threading.Thread(target=listen_to_server, args=(client,), daemon=True)
