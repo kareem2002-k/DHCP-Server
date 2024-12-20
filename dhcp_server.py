@@ -12,10 +12,9 @@ PORT = 65432      # Non-privileged port
 # DHCP Configuration
 IP_POOL_START = '192.168.1.100'
 IP_POOL_END = '192.168.1.200'
-LEASE_TIME = 3600  # Lease time in seconds (1 hour)
+LEASE_TIME = 20  # Lease time in seconds (1 hour)
 OFFER_TIMEOUT = 300  # Time in seconds to hold an offer before releasing
 
-# Dictionaries to manage clients and IPs
 authenticated_clients = {}
 ip_leases = {}
 ip_offers = {}
@@ -37,6 +36,20 @@ def generate_ip_pool(start_ip, end_ip):
     return [int_to_ip(ip) for ip in range(start, end + 1)]
 
 ip_pool = generate_ip_pool(IP_POOL_START, IP_POOL_END)
+
+# Function to insert IP into ip_pool in sorted order
+def insert_ip_sorted(ip_pool, ip):
+    ip_int = ip_to_int(ip)
+    # Binary search for the correct insertion point
+    left = 0
+    right = len(ip_pool)
+    while left < right:
+        mid = (left + right) // 2
+        if ip_to_int(ip_pool[mid]) < ip_int:
+            left = mid + 1
+        else:
+            right = mid
+    ip_pool.insert(left, ip)
 
 # Function to handle client connections
 def handle_client(conn, addr):
@@ -80,15 +93,17 @@ def handle_client(conn, addr):
             # Release IP lease if exists
             if addr in ip_leases:
                 released_ip = ip_leases[addr]['ip']
-                ip_pool.append(released_ip)
+                insert_ip_sorted(ip_pool, released_ip)  # Changed from ip_pool.insert(0, released_ip)
+                client_id = ip_leases[addr]['client_id']
                 del ip_leases[addr]
-                print(f"[LEASE RELEASED] {released_ip} released from {addr}")
+                print(f"[LEASE RELEASED] {released_ip} released from {client_id} ({addr})")
             # Release offered IP if exists
             if addr in ip_offers:
                 released_ip = ip_offers[addr]['ip']
-                ip_pool.append(released_ip)
+                insert_ip_sorted(ip_pool, released_ip)  # Changed from ip_pool.insert(0, released_ip)
+                client_id = ip_offers[addr]['client_id']
                 del ip_offers[addr]
-                print(f"[OFFER RELEASED] {released_ip} released from {addr}")
+                print(f"[OFFER RELEASED] {released_ip} released from {client_id} ({addr})")
         conn.close()
         print(f"[CONNECTION CLOSED] {addr}")
 
@@ -162,7 +177,7 @@ def offer_ip_address(addr, client_id):
         if addr in ip_offers:
             return ip_offers[addr]['ip']
 
-        # Assign first available IP without removing it from the pool
+        # Assign the first available IP (smallest) by popping the first element
         if ip_pool:
             offered_ip = ip_pool.pop(0)
             ip_offers[addr] = {
@@ -200,7 +215,7 @@ def offer_timeout_handler(addr):
     with lock:
         if addr in ip_offers:
             released_ip = ip_offers[addr]['ip']
-            ip_pool.append(released_ip)
+            insert_ip_sorted(ip_pool, released_ip)  # Changed from ip_pool.insert(0, released_ip)
             print(f"[OFFER EXPIRED] {released_ip} released from {ip_offers[addr]['client_id']} ({addr})")
             del ip_offers[addr]
 
@@ -271,7 +286,7 @@ def lease_manager():
             expired_leases = [addr for addr, lease in ip_leases.items() if lease['lease_expiry'] < current_time]
             for addr in expired_leases:
                 released_ip = ip_leases[addr]['ip']
-                ip_pool.append(released_ip)
+                insert_ip_sorted(ip_pool, released_ip)  # Changed from ip_pool.insert(0, released_ip)
                 client_id = ip_leases[addr]['client_id']
                 del ip_leases[addr]
                 print(f"[LEASE EXPIRED] {released_ip} released from {client_id} ({addr})")
