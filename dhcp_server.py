@@ -12,7 +12,7 @@ PORT = 65432      # Non-privileged port
 # DHCP Configuration
 IP_POOL_START = '192.168.1.100'
 IP_POOL_END = '192.168.1.200'
-LEASE_TIME = 20  # Lease time in seconds (1 hour)
+LEASE_TIME = 20  # Lease time in seconds (adjusted to 20 for demo)
 OFFER_TIMEOUT = 300  # Time in seconds to hold an offer before releasing
 
 authenticated_clients = {}
@@ -165,6 +165,24 @@ def handle_dhcp_message(conn, addr, message):
             conn.sendall(json.dumps(response).encode())
             print(f"[DHCP NACK] Invalid IP {requested_ip} requested by {client_id}")
 
+    elif msg_type == "DHCP_RELEASE":
+        # Handle DHCP_RELEASE message
+        requested_ip = message.get("released_ip")
+        if handle_dhcp_release(addr, client_id, requested_ip):
+            response = {
+                "type": "DHCP_RELEASE_ACK",
+                "message": f"IP {requested_ip} has been released."
+            }
+            conn.sendall(json.dumps(response).encode())
+            print(f"[DHCP RELEASE] Released IP {requested_ip} from {client_id} ({addr})")
+        else:
+            response = {
+                "type": "DHCP_NACK",
+                "message": "Release failed. IP not found or not assigned to client."
+            }
+            conn.sendall(json.dumps(response).encode())
+            print(f"[DHCP RELEASE FAILED] {requested_ip} not found for {client_id} ({addr})")
+
     else:
         response = {"type": "ERROR", "message": "Unknown DHCP message type."}
         conn.sendall(json.dumps(response).encode())
@@ -208,6 +226,19 @@ def handle_dhcp_request(addr, client_id, requested_ip):
         }
         del ip_offers[addr]
         return True
+
+# Function to handle DHCP_RELEASE
+def handle_dhcp_release(addr, client_id, released_ip):
+    with lock:
+        # Verify if the IP is leased to this client
+        lease = ip_leases.get(addr)
+        if lease and lease['ip'] == released_ip:
+            # Release the IP
+            insert_ip_sorted(ip_pool, released_ip)
+            del ip_leases[addr]
+            return True
+        else:
+            return False
 
 # Function to handle offer timeout
 def offer_timeout_handler(addr):

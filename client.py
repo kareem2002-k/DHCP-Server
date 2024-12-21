@@ -50,12 +50,20 @@ def start_client():
 
         # Communication Loop
         while True:
-            message = input("You: ")
-            if message.lower() == "exit":
+            message = input("You: ").strip().lower()
+            if message == "exit":
+                # Before exiting, send DHCP_RELEASE if IP is leased
+                release_ip(client, client_id)
                 print("Disconnecting from the server.")
                 break
-            # For simplicity, send regular messages
-            client.sendall(message.encode())
+            elif message == "release":
+                # User can manually release the IP
+                release_ip(client, client_id)
+                print("IP released. You can continue or exit.")
+            else:
+                # For simplicity, send regular messages
+                # You can extend this to handle other DHCP messages if needed
+                print("Unknown command. Type 'release' to release IP or 'exit' to disconnect.")
     except KeyboardInterrupt:
         print("\nDisconnecting from the server.")
     finally:
@@ -98,12 +106,31 @@ def handle_server_message(client, message):
     elif msg_type == "DHCP_NACK":
         nack_message = message.get("message")
         print(f"[DHCP NACK] {nack_message}")
+    elif msg_type == "DHCP_RELEASE_ACK":
+        release_message = message.get("message")
+        print(f"[DHCP RELEASE ACK] {release_message}")
     elif msg_type == "ERROR":
         error_message = message.get("message")
         print(f"[ERROR] {error_message}")
     else:
         # Handle other message types or regular messages
         print(f"[SERVER] {message}")
+
+# Function to send DHCP_RELEASE
+def release_ip(client, client_id):
+    # Assuming the client keeps track of the assigned IP
+    # For simplicity, we can simulate by asking the user
+    released_ip = input("Enter the IP to release: ").strip()
+    if released_ip:
+        dhcp_release = {
+            "type": "DHCP_RELEASE",
+            "client_id": client_id,
+            "released_ip": released_ip
+        }
+        client.sendall(json.dumps(dhcp_release).encode())
+        print(f"[DHCP] Sent DHCP_RELEASE for IP {released_ip}")
+    else:
+        print("No IP entered. Release aborted.")
 
 if __name__ == "__main__":
     start_client()
