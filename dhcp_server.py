@@ -93,14 +93,14 @@ def handle_client(conn, addr):
             # Release IP lease if exists
             if addr in ip_leases:
                 released_ip = ip_leases[addr]['ip']
-                insert_ip_sorted(ip_pool, released_ip)  # Changed from ip_pool.insert(0, released_ip)
+                insert_ip_sorted(ip_pool, released_ip)
                 client_id = ip_leases[addr]['client_id']
                 del ip_leases[addr]
                 print(f"[LEASE RELEASED] {released_ip} released from {client_id} ({addr})")
             # Release offered IP if exists
             if addr in ip_offers:
                 released_ip = ip_offers[addr]['ip']
-                insert_ip_sorted(ip_pool, released_ip)  # Changed from ip_pool.insert(0, released_ip)
+                insert_ip_sorted(ip_pool, released_ip)
                 client_id = ip_offers[addr]['client_id']
                 del ip_offers[addr]
                 print(f"[OFFER RELEASED] {released_ip} released from {client_id} ({addr})")
@@ -131,57 +131,77 @@ def handle_dhcp_message(conn, addr, message):
                 "client_id": client_id,
                 "offered_ip": offer_ip,
                 "lease_time": LEASE_TIME,
-                "subnet_mask": "255.255.255.0",
-                "router": "192.168.1.1",
-                "dns_server": "8.8.8.8"
+                "options": {
+                    "subnet_mask": "255.255.255.0",       # Option 1
+                    "router": "192.168.1.1",              # Option 3
+                    "dns_server": "8.8.8.8",              # Option 6
+                    "domain_name": "example.com",         # Option 15
+                    "dhcp_server_identifier": "192.168.1.1"  # Option 54
+                }
             }
             conn.sendall(json.dumps(response).encode())
             print(f"[DHCP OFFER] Offered IP {offer_ip} to {client_id}")
         else:
             response = {
                 "type": "DHCP_NACK",
-                "message": "No available IP addresses."
+                "message": "No available IP addresses.",
+                "error_message": "IP pool exhausted."
             }
             conn.sendall(json.dumps(response).encode())
             print(f"[DHCP NACK] No available IP for {client_id}")
 
     elif msg_type == "DHCP_REQUEST":
         requested_ip = message.get("requested_ip")
+        # Option 50: Requested IP Address
+        requested_ip_option = message.get("options", {}).get("requested_ip")
+        if requested_ip_option:
+            requested_ip = requested_ip_option
         if handle_dhcp_request(addr, client_id, requested_ip):
             assigned_ip = ip_leases[addr]['ip']
             response = {
                 "type": "DHCP_ACK",
                 "client_id": client_id,
                 "assigned_ip": assigned_ip,
-                "lease_time": LEASE_TIME
+                "lease_time": LEASE_TIME,
+                "options": {
+                    "subnet_mask": "255.255.255.0",       # Option 1
+                    "router": "192.168.1.1",              # Option 3
+                    "dns_server": "8.8.8.8",              # Option 6
+                    "domain_name": "example.com",         # Option 15
+                    "dhcp_server_identifier": "192.168.1.1",  # Option 54
+                    "renewal_time": LEASE_TIME / 2,       # Option 58
+                    "rebinding_time": (LEASE_TIME * 7) / 8  # Option 59
+                }
             }
             conn.sendall(json.dumps(response).encode())
             print(f"[DHCP ACK] Assigned IP {assigned_ip} to {client_id}")
         else:
             response = {
                 "type": "DHCP_NACK",
-                "message": "Requested IP is invalid or unavailable."
+                "message": "Requested IP is invalid or unavailable.",
+                "error_message": f"The IP address {requested_ip} is invalid or already in use."
             }
             conn.sendall(json.dumps(response).encode())
             print(f"[DHCP NACK] Invalid IP {requested_ip} requested by {client_id}")
 
     elif msg_type == "DHCP_RELEASE":
         # Handle DHCP_RELEASE message
-        requested_ip = message.get("released_ip")
-        if handle_dhcp_release(addr, client_id, requested_ip):
+        released_ip = message.get("released_ip")
+        if handle_dhcp_release(addr, client_id, released_ip):
             response = {
                 "type": "DHCP_RELEASE_ACK",
-                "message": f"IP {requested_ip} has been released."
+                "message": f"IP {released_ip} has been released."
             }
             conn.sendall(json.dumps(response).encode())
-            print(f"[DHCP RELEASE] Released IP {requested_ip} from {client_id} ({addr})")
+            print(f"[DHCP RELEASE] Released IP {released_ip} from {client_id} ({addr})")
         else:
             response = {
                 "type": "DHCP_NACK",
-                "message": "Release failed. IP not found or not assigned to client."
+                "message": "Release failed. IP not found or not assigned to client.",
+                "error_message": f"The IP address {released_ip} is not assigned to you."
             }
             conn.sendall(json.dumps(response).encode())
-            print(f"[DHCP RELEASE FAILED] {requested_ip} not found for {client_id} ({addr})")
+            print(f"[DHCP RELEASE FAILED] {released_ip} not found for {client_id} ({addr})")
 
     else:
         response = {"type": "ERROR", "message": "Unknown DHCP message type."}
@@ -246,7 +266,7 @@ def offer_timeout_handler(addr):
     with lock:
         if addr in ip_offers:
             released_ip = ip_offers[addr]['ip']
-            insert_ip_sorted(ip_pool, released_ip)  # Changed from ip_pool.insert(0, released_ip)
+            insert_ip_sorted(ip_pool, released_ip)
             print(f"[OFFER EXPIRED] {released_ip} released from {ip_offers[addr]['client_id']} ({addr})")
             del ip_offers[addr]
 
@@ -317,7 +337,7 @@ def lease_manager():
             expired_leases = [addr for addr, lease in ip_leases.items() if lease['lease_expiry'] < current_time]
             for addr in expired_leases:
                 released_ip = ip_leases[addr]['ip']
-                insert_ip_sorted(ip_pool, released_ip)  # Changed from ip_pool.insert(0, released_ip)
+                insert_ip_sorted(ip_pool, released_ip)
                 client_id = ip_leases[addr]['client_id']
                 del ip_leases[addr]
                 print(f"[LEASE EXPIRED] {released_ip} released from {client_id} ({addr})")
