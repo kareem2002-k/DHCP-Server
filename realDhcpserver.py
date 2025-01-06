@@ -1,137 +1,208 @@
 #!/usr/bin/env python3
 import socket
 import struct
+import threading
+from datetime import datetime, timedelta
+import json
 import time
 import sys
 import ipaddress  # for broadcast address calculation
+import logging
 
 # ------------------ DHCP SERVER SETTINGS ------------------ #
-SERVER_IP            = "172.23.208.1"
-SERVER_PORT          = 67                 # Standard DHCP/BOOTP server port
-CLIENT_PORT          = 68                 # Standard DHCP/BOOTP client port
-NETWORK_MASK         = "255.255.240.0"
-DEFAULT_GATEWAY      = "172.23.208.1"
-DNS_SERVER           = "8.8.8.8"
-DOMAIN_NAME          = "example.com"
-LEASE_TIME           = 120                # Lease time in seconds
-RENEWAL_TIME         = LEASE_TIME // 2
-REBINDING_TIME       = (LEASE_TIME * 7) // 8
+SERVER_IP = '192.168.1.1'  # The IP address of your server
+SERVER_PORT = 67            # Standard DHCP/BOOTP server port
+CLIENT_PORT = 68            # Standard DHCP/BOOTP client port
+NETWORK_MASK = "255.255.255.0"
+DEFAULT_GATEWAY = "192.168.1.1"
+DNS_SERVER = "8.8.8.8"
+DOMAIN_NAME = "example.com"
+LEASE_TIME = 86400         # Lease time in seconds (24 hours)
+RENEWAL_TIME = LEASE_TIME // 2
+REBINDING_TIME = (LEASE_TIME * 7) // 8
 
-# Dynamically calculate broadcast IP from SERVER_IP and NETWORK_MASK
-def get_broadcast_address(ip_str, mask_str):
-    """Calculate the broadcast address given an IP and subnet mask."""
-    network = ipaddress.ip_network(f"{ip_str}/{mask_str}", strict=False)
-    return str(network.broadcast_address)
+# JSON files for persistence
+IP_POOL_FILE = 'ip_pool.json'
+LEASE_DATABASE_FILE = 'lease_database.json'
+OFFERED_IPS_FILE = 'offered_ips.json'  # To track offered but not yet acknowledged IPs
 
-BROADCAST_IP = get_broadcast_address(SERVER_IP, NETWORK_MASK)
-print(f"[DEBUG] Using BROADCAST_IP = {BROADCAST_IP}")
+# Threading lock (Reentrant Lock)
+LOCK = threading.RLock()
 
-# IP pool range
-IP_POOL_START = "172.23.208.100"
-IP_POOL_END   = "172.23.208.200"
+# DHCP Message Types
+DHCP_DISCOVER = 1
+DHCP_OFFER = 2
+DHCP_REQUEST = 3
+DHCP_ACK = 5
+DHCP_NAK = 6
+DHCP_RELEASE = 7
+DHCP_INFORM = 8
 
 # ------------------ GLOBALS ------------------ #
-leases = {}  # key: client_mac_str, val: { 'ip': '...', 'expiry': ... }
-ip_pool = [] # list of available IP strings
+leases = {}      # key: client_mac_str, val: { 'ip': '...', 'expiry': ... }
+ip_pool = {}     # key: ip_str, value: "available" | "offered" | "in_use"
+offered_ips = {} # key: client_mac_str, value: ip_str
 
-# ------------------ UTILS ------------------ #
+# ------------------ LOGGING CONFIGURATION ------------------ #
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='[%(levelname)s] %(message)s',
+    handlers=[
+        logging.FileHandler("dhcp_server.log"),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+
+# ------------------ UTILITIES ------------------ #
+
+def load_json_data():
+    global ip_pool, leases, offered_ips
+    # Load IP Pool
+    try:
+        with open(IP_POOL_FILE, "r") as file:
+            ip_pool = json.load(file)
+            logging.info(f"Loaded {IP_POOL_FILE}")
+    except FileNotFoundError:
+        ip_pool = {"192.168.1." + str(i): "available" for i in range(100, 200)}
+        save_json_data(IP_POOL_FILE, ip_pool)
+        logging.info(f"{IP_POOL_FILE} not found. Initialized with default data.")
+
+    # Load Lease Database
+    try:
+        with open(LEASE_DATABASE_FILE, "r") as file:
+            leases = json.load(file)
+            logging.info(f"Loaded {LEASE_DATABASE_FILE}")
+    except FileNotFoundError:
+        leases = {}
+        save_json_data(LEASE_DATABASE_FILE, leases)
+        logging.info(f"{LEASE_DATABASE_FILE} not found. Initialized with default data.")
+
+    # Load Offered IPs
+    try:
+        with open(OFFERED_IPS_FILE, "r") as file:
+            offered_ips = json.load(file)
+            logging.info(f"Loaded {OFFERED_IPS_FILE}")
+    except FileNotFoundError:
+        offered_ips = {}
+        save_json_data(OFFERED_IPS_FILE, offered_ips)
+        logging.info(f"{OFFERED_IPS_FILE} not found. Initialized with default data.")
+
+def save_json_data(file_path, data):
+    with LOCK:
+        try:
+            with open(file_path, 'w') as file:
+                json.dump(data, file, indent=4)
+                logging.info(f"Saved data to {file_path}")
+        except Exception as e:
+            logging.error(f"Failed to save {file_path}: {e}")
+
 def ip_to_int(ip_str):
-    parts = [int(x) for x in ip_str.split('.')]
-    return (parts[0] << 24) + (parts[1] << 16) + (parts[2] << 8) + parts[3]
+    return int(ipaddress.IPv4Address(ip_str))
 
 def int_to_ip(ip_int):
-    return ".".join([
-        str((ip_int >> 24) & 0xFF),
-        str((ip_int >> 16) & 0xFF),
-        str((ip_int >> 8) & 0xFF),
-        str(ip_int & 0xFF)
-    ])
+    return str(ipaddress.IPv4Address(ip_int))
 
 def generate_ip_pool(start_ip, end_ip):
-    """Generate a sorted list of IPs in the given range."""
+    """Generate a dictionary of IPs in the given range, all marked as 'available'."""
     start = ip_to_int(start_ip)
-    end   = ip_to_int(end_ip)
-    return [int_to_ip(ip) for ip in range(start, end + 1)]
+    end = ip_to_int(end_ip)
+    pool = {}
+    for ip_int in range(start, end + 1):
+        ip_str = int_to_ip(ip_int)
+        pool[ip_str] = "available"
+    return pool
 
-def insert_ip_sorted(ip_list, ip):
-    """Insert an IP address back into the pool in sorted order."""
-    target_int = ip_to_int(ip)
-    left, right = 0, len(ip_list)
-    while left < right:
-        mid = (left + right) // 2
-        mid_int = ip_to_int(ip_list[mid])
-        if mid_int < target_int:
-            left = mid + 1
-        else:
-            right = mid
-    ip_list.insert(left, ip)
+# Set BROADCAST_IP to '255.255.255.255' for maximum compatibility
+BROADCAST_IP = '255.255.255.255'
+logging.debug(f"Using BROADCAST_IP = {BROADCAST_IP}")
 
 def get_mac_str(data, offset=28):
     """Extract MAC address from the packet (offset=28 for DHCP)."""
+    if len(data) < offset + 6:
+        logging.debug("Not enough data to extract MAC address.")
+        return '00:00:00:00:00:00'
     return ":".join(["{:02x}".format(x) for x in data[offset:offset+6]])
 
-# ------------------ DHCP PACKET PARSING & BUILDING ------------------ #
 def parse_dhcp_packet(data):
     """Parse a raw DHCP packet (UDP payload)."""
     if len(data) < 240:
-        print("[DEBUG] Packet too short to be a valid DHCP packet.")
+        logging.debug("Packet too short to be a valid DHCP packet.")
         return None
 
     packet = {}
-    (
-        packet['op'],
-        packet['htype'],
-        packet['hlen'],
-        packet['hops'],
-        packet['xid'],
-        packet['secs'],
-        packet['flags'],
-        packet['ciaddr'],
-        packet['yiaddr'],
-        packet['siaddr'],
-        packet['giaddr']
-    ) = struct.unpack('!BBBBIHHIIII', data[:28])
+    try:
+        # Unpack the fixed parts of the DHCP packet
+        (
+            packet['op'],
+            packet['htype'],
+            packet['hlen'],
+            packet['hops'],
+            packet['xid'],
+            packet['secs'],
+            packet['flags'],
+            packet['ciaddr'],
+            packet['yiaddr'],
+            packet['siaddr'],
+            packet['giaddr']
+        ) = struct.unpack('!BBBBIHHIIII', data[:28])
 
-    # chaddr is 16 bytes; MAC is first 6 bytes
-    packet['chaddr'] = data[28:28+16]
-    packet['client_mac_str'] = get_mac_str(data, 28)
+        # Extract the client MAC address
+        packet['chaddr'] = data[28:28+16]
+        packet['client_mac_str'] = get_mac_str(data, 28)
 
-    magic_cookie = data[236:240]
-    if magic_cookie != b'\x63\x82\x53\x63':
-        print("[DEBUG] Missing or invalid DHCP magic cookie.")
+        # Verify the magic cookie
+        magic_cookie = data[236:240]
+        if magic_cookie != b'\x63\x82\x53\x63':
+            logging.debug("Missing or invalid DHCP magic cookie.")
+            return None
+
+        # Parse DHCP options
+        packet['options'] = {}
+        options_data = data[240:]
+        idx = 0
+        while idx < len(options_data):
+            opt_type = options_data[idx]
+            if opt_type == 255:  # END option
+                break
+            elif opt_type == 0:  # PAD option
+                idx += 1
+                continue
+            else:
+                if idx + 1 >= len(options_data):
+                    logging.debug("Option length exceeds data length.")
+                    break
+                opt_len = options_data[idx + 1]
+                if idx + 2 + opt_len > len(options_data):
+                    logging.debug("Option value exceeds data length.")
+                    break
+                opt_val = options_data[idx + 2:idx + 2 + opt_len]
+                packet['options'][opt_type] = opt_val
+                idx += 2 + opt_len
+
+        # Ensure 'mac' is always set
+        if 'client_mac_str' in packet and packet['client_mac_str']:
+            packet['mac'] = packet['client_mac_str']
+        else:
+            packet['mac'] = '00:00:00:00:00:00'  # Default MAC if extraction fails
+            logging.debug("MAC address extraction failed. Setting to default '00:00:00:00:00:00'.")
+
+        logging.debug(f"Parsed packet: op={packet['op']}, mac={packet['mac']}, xid=0x{packet['xid']:08x}")
+        return packet
+    except struct.error as e:
+        logging.error(f"Failed to unpack DHCP packet: {e}")
         return None
 
-    # Parse DHCP options
-    packet['options'] = {}
-    options_data = data[240:]
-    idx = 0
-    while idx < len(options_data):
-        opt_type = options_data[idx]
-        if opt_type == 255:  # END option
-            break
-        elif opt_type == 0: # PAD
-            idx += 1
-            continue
-        else:
-            if idx+1 >= len(options_data):
-                break
-            opt_len = options_data[idx+1]
-            if idx + 2 + opt_len > len(options_data):
-                break
-            opt_val = options_data[idx+2:idx+2+opt_len]
-            packet['options'][opt_type] = opt_val
-            idx += 2 + opt_len
-
-    return packet
-
-def build_dhcp_packet(msg_type, transaction_id, your_ip, client_mac_str,
-                      server_id=SERVER_IP, requested_ip="0.0.0.0"):
-    """Build a minimal DHCP packet for OFFER/ACK responses."""
-    yiaddr_int = ip_to_int(your_ip)
-    siaddr_int = ip_to_int(server_id)
+def create_dhcp_packet(op, xid, yiaddr, mac_addr, msg_type):
+    """Build a minimal DHCP packet for OFFER/ACK/NAK responses."""
+    yiaddr_int = ip_to_int(yiaddr)
+    siaddr_int = ip_to_int(SERVER_IP)
     giaddr_int = 0
 
-    mac_bytes = bytes(int(x, 16) for x in client_mac_str.split(":"))
+    try:
+        mac_bytes = bytes(int(x, 16) for x in mac_addr.split(":"))
+    except ValueError as e:
+        logging.error(f"Invalid MAC address format: {e}")
+        return None
 
     # DHCP header
     op = 2  # BOOTREPLY
@@ -139,18 +210,22 @@ def build_dhcp_packet(msg_type, transaction_id, your_ip, client_mac_str,
     hlen = 6
     hops = 0
     secs = 0
-    flags = 0x8000  # **Set the broadcast flag**
+    flags = 0x8000  # Broadcast flag
 
-    dhcp_header = struct.pack(
-        '!BBBBIHHIIII16s192s',
-        op, htype, hlen, hops, transaction_id, secs, flags,
-        0,               # ciaddr
-        yiaddr_int,      # yiaddr
-        siaddr_int,      # siaddr
-        giaddr_int,      # giaddr
-        mac_bytes + b'\x00' * (16 - len(mac_bytes)),
-        b'\x00'*192
-    )
+    try:
+        dhcp_header = struct.pack(
+            '!BBBBIHHIIII16s192s',
+            op, htype, hlen, hops, xid, secs, flags,
+            0,               # ciaddr
+            yiaddr_int,      # yiaddr
+            siaddr_int,      # siaddr
+            giaddr_int,      # giaddr
+            mac_bytes + b'\x00' * (16 - len(mac_bytes)),
+            b'\x00' * 192
+        )
+    except struct.error as e:
+        logging.error(f"Failed to pack DHCP header: {e}")
+        return None
 
     magic_cookie = b'\x63\x82\x53\x63'
 
@@ -160,7 +235,7 @@ def build_dhcp_packet(msg_type, transaction_id, your_ip, client_mac_str,
     # Option 53: DHCP Message Type
     options += b'\x35\x01' + bytes([msg_type])
     # Option 54: DHCP Server Identifier
-    options += b'\x36\x04' + socket.inet_aton(server_id)
+    options += b'\x36\x04' + socket.inet_aton(SERVER_IP)
     # Option 51: IP Address Lease Time
     options += b'\x33\x04' + struct.pack('!I', LEASE_TIME)
     # Option 1: Subnet Mask
@@ -180,203 +255,162 @@ def build_dhcp_packet(msg_type, transaction_id, your_ip, client_mac_str,
     # End
     options += b'\xff'
 
-    return dhcp_header + magic_cookie + options
+    dhcp_packet = dhcp_header + magic_cookie + options
 
-# ------------------ IP ADDRESS ALLOCATION ------------------ #
-def get_free_ip():
-    """Get the next free IP from the pool (if available)."""
-    print("[DEBUG] get_free_ip() called.")
-    if not ip_pool:
-        print("[DEBUG] IP pool is empty!")
-        return None
-    ip_addr = ip_pool.pop(0)
-    print(f"[DEBUG] get_free_ip() returning {ip_addr}")
-    return ip_addr
+    logging.debug(f"DHCP Packet Length: {len(dhcp_packet)} bytes")
 
-def release_ip(ip):
-    """Return an IP address to the free pool."""
-    print(f"[DEBUG] release_ip({ip}) called.")
-    insert_ip_sorted(ip_pool, ip)
+    return dhcp_packet
 
-# ------------------ DHCP SERVER MAIN LOOP ------------------ #
-def dhcp_server():
-    """Listen on UDP port 67 for DHCP packets, respond accordingly."""
-    print(f"[DEBUG] Binding DHCP server to {SERVER_IP}:{SERVER_PORT}")
+def get_requested_ip(packet):
+    # Try to get requested IP from DHCP options
+    if 50 in packet['options']:  # Option 50 is Requested IP Address
+        return socket.inet_ntoa(packet['options'][50])
+    return None
+
+def handle_dhcp_discover(server_socket, packet):
+    client_mac = packet['mac']
+    xid = packet['xid']
+    logging.info(f"DHCP DISCOVER from {client_mac}")
+
+    # Check if this MAC already has a lease
+    if client_mac in leases:
+        available_ip = leases[client_mac]['ip']
+        logging.debug(f"Client {client_mac} already has lease: {available_ip}")
+    else:
+        # Find new available IP
+        available_ip = None
+        with LOCK:
+            for ip, status in ip_pool.items():
+                if status == "available" and not any(lease['ip'] == ip for lease in leases.values()):
+                    available_ip = ip
+                    ip_pool[ip] = "offered"
+                    offered_ips[client_mac] = ip
+                    save_json_data(IP_POOL_FILE, ip_pool)
+                    logging.debug(f"IP {ip} offered to {client_mac}")
+                    break
+
+    if available_ip:
+        response = create_dhcp_packet(2, xid, available_ip, client_mac, DHCP_OFFER)
+        if response is None:
+            logging.error(f"Failed to create DHCP OFFER for {available_ip} to {client_mac}")
+            return
+        try:
+            server_socket.sendto(response, (BROADCAST_IP, CLIENT_PORT))
+            logging.info(f"Offered {available_ip} to {client_mac} XID=0x{xid:08x}")
+        except Exception as e:
+            logging.error(f"Failed to send DHCPOFFER: {e}")
+
+def handle_dhcp_request(server_socket, packet):
+    client_mac = packet['mac']
+    xid = packet['xid']
+    logging.info(f"DHCP REQUEST from {client_mac}")
+
+    # Get the requested IP
+    requested_ip = get_requested_ip(packet)
+    if not requested_ip and client_mac in offered_ips:
+        requested_ip = offered_ips[client_mac]
+    elif client_mac in leases:
+        requested_ip = leases[client_mac]['ip']
+
+    # Verify IP is available or already assigned to this MAC
+    if requested_ip and (
+        ip_pool.get(requested_ip) == "offered" or 
+        (client_mac in leases and leases[client_mac]['ip'] == requested_ip)
+    ):
+        with LOCK:
+            response = create_dhcp_packet(2, xid, requested_ip, client_mac, DHCP_ACK)
+            if response is None:
+                logging.error(f"Failed to create DHCP ACK for {requested_ip} to {client_mac}")
+                return
+            try:
+                server_socket.sendto(response, (BROADCAST_IP, CLIENT_PORT))
+                logging.info(f"Assigned {requested_ip} to {client_mac} XID=0x{xid:08x}")
+            except Exception as e:
+                logging.error(f"Failed to send DHCPACK: {e}")
+
+            # Update lease database
+            ip_pool[requested_ip] = "in_use"
+            leases[client_mac] = {
+                "ip": requested_ip,
+                "lease_expiration": (datetime.now() + timedelta(seconds=LEASE_TIME)).isoformat()
+            }
+            if client_mac in offered_ips:
+                del offered_ips[client_mac]
+            save_json_data(IP_POOL_FILE, ip_pool)
+            save_json_data(LEASE_DATABASE_FILE, leases)
+    else:
+        # Send NAK if requested IP is not available
+        response = create_dhcp_packet(2, xid, '0.0.0.0', client_mac, DHCP_NAK)
+        if response is None:
+            logging.error(f"Failed to create DHCP NAK for {client_mac}")
+            return
+        try:
+            server_socket.sendto(response, (BROADCAST_IP, CLIENT_PORT))
+            logging.info(f"Sent NAK to {client_mac} for IP {requested_ip}")
+        except Exception as e:
+            logging.error(f"Failed to send DHCPNAK: {e}")
+
+def lease_manager():
+    """Background thread to manage lease expiration."""
+    while True:
+        time.sleep(60)  # Check every minute
+        current_time = datetime.now()
+        with LOCK:
+            expired_leases = [mac for mac, lease in leases.items() if datetime.fromisoformat(lease['lease_expiration']) < current_time]
+            for mac in expired_leases:
+                ip = leases[mac]['ip']
+                del leases[mac]
+                ip_pool[ip] = "available"
+                logging.info(f"Lease expired for {mac}, IP {ip} released.")
+            if expired_leases:
+                save_json_data(IP_POOL_FILE, ip_pool)
+                save_json_data(LEASE_DATABASE_FILE, leases)
+
+def start_server():
+    load_json_data()
+
+    # Start lease manager thread
+    lease_thread = threading.Thread(target=lease_manager, daemon=True)
+    lease_thread.start()
+    logging.info("Started lease manager thread.")
+
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-
+    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
-        # Bind to port 67 on the specific server IP
-        server_socket.bind((SERVER_IP, SERVER_PORT))
+        server_socket.bind(('', SERVER_PORT))
     except Exception as e:
-        print(f"[ERROR] Could not bind to UDP port {SERVER_PORT} on {SERVER_IP}: {e}")
+        logging.error(f"Could not bind to UDP port {SERVER_PORT}: {e}")
         sys.exit(1)
 
-    print(f"[DHCP SERVER] Listening on {SERVER_IP}:{SERVER_PORT} (UDP)")
+    logging.info(f"DHCP Server is running on {SERVER_IP}:{SERVER_PORT}...")
 
     while True:
         try:
             data, addr = server_socket.recvfrom(1024)
-            if not data:
-                continue
-
             packet = parse_dhcp_packet(data)
+
             if not packet:
                 continue
 
-            client_mac_str = packet['client_mac_str']
-            xid = packet['xid']
-            options = packet['options']
-
-            if 53 not in options:
-                print("[DEBUG] No DHCP message type found in packet.")
+            logging.debug(f"Received packet from address: {addr}")
+            try:
+                client_mac = packet['mac']
+                logging.debug(f"Client MAC: {client_mac}")
+            except KeyError:
+                logging.error("'mac' key missing in packet.")
                 continue
 
-            msg_type = options[53][0]
-            # 1 = DHCPDISCOVER, 3 = DHCPREQUEST, 4=DECLINE, 5=ACK, 6=NAK, 7=RELEASE, 8=INFORM
-            if msg_type == 1:
-                # DHCPDISCOVER -> DHCPOFFER
-                print(f"[DISCOVER] From {client_mac_str} XID=0x{xid:08x}")
+            if 53 in packet['options']:
+                msg_type = packet['options'][53][0]
+                if msg_type == DHCP_DISCOVER:
+                    handle_dhcp_discover(server_socket, packet)
+                elif msg_type == DHCP_REQUEST:
+                    handle_dhcp_request(server_socket, packet)
+                # Add handlers for other message types as needed
 
-                # ALLOCATION LOGIC
-                offered_ip = None
-                if client_mac_str in leases:
-                    offered_ip = leases[client_mac_str]['ip']
-                    print(f"[DEBUG] Client already had lease: {offered_ip}")
-                else:
-                    offered_ip = get_free_ip()
-                    if offered_ip is None:
-                        # Provide fallback for testing
-                        offered_ip = "172.23.208.250"
-                        print("[DEBUG] Fallback IP assigned:", offered_ip)
-
-                print("[DEBUG] About to build DHCPOFFER with IP =", offered_ip)
-                reply = build_dhcp_packet(
-                    msg_type=2,      # DHCPOFFER
-                    transaction_id=xid,
-                    your_ip=offered_ip,
-                    client_mac_str=client_mac_str
-                )
-                try:
-                    server_socket.sendto(reply, (BROADCAST_IP, CLIENT_PORT))
-                    print(f"[OFFER] Offering {offered_ip} to {client_mac_str} XID=0x{xid:08x}")
-                except Exception as e:
-                    print(f"[ERROR] Failed to send DHCPOFFER: {e}")
-
-            elif msg_type == 3:
-                # DHCPREQUEST -> DHCPACK or DHCPNAK
-                print(f"[REQUEST] From {client_mac_str} XID=0x{xid:08x}")
-                requested_ip = None
-                req_server_ip = None
-
-                if 50 in options:
-                    requested_ip = socket.inet_ntoa(options[50])
-                if 54 in options:
-                    req_server_ip = socket.inet_ntoa(options[54])
-
-                print(f"[DEBUG] Requested IP={requested_ip}, Server ID in packet={req_server_ip}")
-
-                # If the client is selecting an IP from *this* server
-                if req_server_ip is None or req_server_ip == SERVER_IP:
-                    if not requested_ip:
-                        # Maybe client has an existing lease
-                        if client_mac_str in leases:
-                            requested_ip = leases[client_mac_str]['ip']
-                        if not requested_ip:
-                            print("  [REQUEST] No requested IP found. Ignoring.")
-                            continue
-
-                    # Validate the IP
-                    in_pool = (requested_ip in ip_pool)
-                    in_lease = any(
-                        (leases[mac]['ip'] == requested_ip) for mac in leases if mac != client_mac_str
-                    )
-                    if in_lease:
-                        # IP in use -> NAK
-                        nak_packet = build_dhcp_packet(
-                            msg_type=6,  # DHCPNAK
-                            transaction_id=xid,
-                            your_ip="0.0.0.0",
-                            client_mac_str=client_mac_str
-                        )
-                        server_socket.sendto(nak_packet, (BROADCAST_IP, CLIENT_PORT))
-                        print(f"  [NAK] IP {requested_ip} is in use, sent NAK to {client_mac_str}")
-                        continue
-                    else:
-                        # If IP was free in the pool, remove it
-                        if in_pool:
-                            print("[DEBUG] Removing requested IP from pool:", requested_ip)
-                            ip_pool.remove(requested_ip)
-
-                    # Record or update the lease
-                    leases[client_mac_str] = {
-                        'ip': requested_ip,
-                        'expiry': time.time() + LEASE_TIME
-                    }
-
-                    # Send DHCPACK
-                    ack_packet = build_dhcp_packet(
-                        msg_type=5,  # DHCPACK
-                        transaction_id=xid,
-                        your_ip=requested_ip,
-                        client_mac_str=client_mac_str
-                    )
-                    try:
-                        server_socket.sendto(ack_packet, (BROADCAST_IP, CLIENT_PORT))
-                        print(f"  [ACK] Assigned {requested_ip} to {client_mac_str} XID=0x{xid:08x}")
-                    except Exception as e:
-                        print(f"[ERROR] Failed to send DHCPACK: {e}")
-                else:
-                    # Client requesting from another DHCP server
-                    print(f"  [REQUEST IGNORED] Client {client_mac_str} wants server {req_server_ip}")
-
-            elif msg_type == 7:
-                # DHCPRELEASE
-                print(f"[RELEASE] from {client_mac_str}")
-                if client_mac_str in leases:
-                    released_ip = leases[client_mac_str]['ip']
-                    del leases[client_mac_str]
-                    release_ip(released_ip)
-                    print(f"  [RELEASED] IP {released_ip} from {client_mac_str}")
-                else:
-                    print(f"  [RELEASE] No lease found for {client_mac_str}")
-
-            elif msg_type == 4:
-                # DHCPDECLINE
-                print(f"[DECLINE] from {client_mac_str}")
-                if client_mac_str in leases:
-                    declined_ip = leases[client_mac_str]['ip']
-                    del leases[client_mac_str]
-                    release_ip(declined_ip)
-                    print(f"  [DECLINED] Freed {declined_ip} from {client_mac_str}")
-
-            elif msg_type == 8:
-                # DHCPINFORM
-                print(f"[INFORM] from {client_mac_str}")
-                inform_ack = build_dhcp_packet(
-                    msg_type=5,  # DHCPACK
-                    transaction_id=xid,
-                    your_ip="0.0.0.0",
-                    client_mac_str=client_mac_str
-                )
-                server_socket.sendto(inform_ack, (BROADCAST_IP, CLIENT_PORT))
-                print(f"  [ACK to INFORM] Sent config to {client_mac_str}")
-
-            else:
-                print(f"[UNKNOWN] DHCP message type {msg_type} from {client_mac_str}")
         except Exception as e:
-            print(f"[ERROR] Exception in main loop: {e}")
-# ------------------ MAIN ------------------ #
+            logging.error(f"Exception in main loop: {e}")
+
 if __name__ == "__main__":
-    # Initialize the IP pool
-    ip_pool = generate_ip_pool(IP_POOL_START, IP_POOL_END)
-    print(f"[INIT] IP Pool size: {len(ip_pool)}")
-    print(f"[INIT] First 5 IPs in pool: {ip_pool[:5]} ...")
-
-    # -------------- NO LEASE MANAGER THREAD --------------
-    # We remove the concurrency to avoid deadlocks. 
-    # If you need lease expiration, handle it manually or in an external cron job.
-
-    # Start DHCP server (blocking call)
-    dhcp_server()
+    start_server()
