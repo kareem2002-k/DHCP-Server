@@ -1,0 +1,53 @@
+======================
+Networks Project 
+======================
+
+Contributions and Code Division
+
+
+
+--------------------------------------------------------------------------------
+1. Kareem Ahmed Sameer (ID: 21P0096)
+--------------------------------------------------------------------------------
+   - Focused on the DHCP message handlers for `DISCOVER`, `REQUEST`, `RELEASE`,
+     and `INFORM`. 
+   - Developed core logic within `handle_dhcp_discover()`, `handle_dhcp_request()`,
+     and `handle_dhcp_release()`.
+   - Contributed to lease database updates and ensuring correct state 
+     transitions (offered, in-use, available, etc.).
+
+--------------------------------------------------------------------------------
+2. Youssef Mahmoud Hassan (ID: 21P0130)
+--------------------------------------------------------------------------------
+   - Led the implementation of DHCP packet creation, including crafting the
+     DHCP headers and adding essential and optional RFC2132 options 
+     (Subnet Mask, Router, DNS Servers, Time Server, etc.).
+   - Wrote the `create_dhcp_packet()` function and verified the correctness
+     of the generated DHCP responses.
+
+--------------------------------------------------------------------------------
+3. Omar Ahmed Salah Ahmed (ID: 2100790)
+--------------------------------------------------------------------------------
+- Handled JSON file operations, including loading, saving, and error handling.
+- Enhanced input validation and implemented `parse_dhcp_packet()` for extracting DHCP fields.
+- Led project documentation and contributed to final integration and testing.
+
+--------------------------------------------------------------------------------
+4. Basel Ashraf Fikry (ID: 22P0122)
+--------------------------------------------------------------------------------
+   - Implemented the `lease_manager()` function to handle lease expirations,
+     background cleanup, and automatic release of expired IP addresses.
+   - Managed the server loop in `start_server()`, ensuring proper binding 
+     to port 67 and routing incoming DHCP packets to the correct handler.
+   - Created or integrated any GUI components and ensured 
+     that logging messages and interactive outputs were available for user 
+     feedback.
+
+--------------------------------------------------------------------------------
+
+NOTES:
+- Each team member collaborated closely to ensure the DHCP server follows
+  the fundamental guidelines of RFC 2131 and RFC 2132.
+
+======================
+======================
